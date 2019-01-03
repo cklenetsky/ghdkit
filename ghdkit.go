@@ -56,6 +56,9 @@ type soundPlayerInfo struct {
 var (
 	soundPlayer     map[soundType]soundPlayerInfo
 	soundPlayerLock sync.RWMutex
+
+	layouts       []map[int]soundType // an array of layouts that map pad/pedal hits to sounds
+	currentLayout = DPAD_UP
 )
 
 //export SoundCallback
@@ -113,12 +116,13 @@ func initSounds() {
 		filename string
 		sound    soundType
 	}{
-		{"lochrome.wav", SNARE},
+		{"snare1.wav", SNARE},
 		{"crashCymbal.wav", CRASH_CYMBAL},
 		{"hiroomtm.wav", TOM},
 		{"Floor-Tom-3.wav", FLOOR_TOM},
 		{"Deep-Kick.wav", BASS_PEDAL},
 		{"Closed-Hi-Hat-4.wav", HIGH_HAT_CLOSED_HIT},
+		{"Ride-Cymbal-2.wav", RIDE_CYMBAL},
 	}
 
 	soundPlayerLock.Lock()
@@ -131,6 +135,37 @@ func initSounds() {
 			soundPlayer[entry.sound] = *info
 		}
 	}
+
+	layouts = make([]map[int]soundType, 0xff)
+
+	// default layout
+	layouts[DPAD_UP] = map[int]soundType{
+		RED:       SNARE,
+		BLUE:      TOM,
+		GREEN:     FLOOR_TOM,
+		YELLOW:    HIGH_HAT_CLOSED_HIT,
+		ORANGE:    CRASH_CYMBAL,
+		KICKPEDAL: BASS_PEDAL,
+	}
+	// orange ride cymbal
+	layouts[DPAD_RIGHT] = map[int]soundType{
+		RED:       SNARE,
+		BLUE:      TOM,
+		GREEN:     FLOOR_TOM,
+		YELLOW:    HIGH_HAT_CLOSED_HIT,
+		ORANGE:    RIDE_CYMBAL,
+		KICKPEDAL: BASS_PEDAL,
+	}
+	// orange ride cymbal, yellow crash cymbal
+	layouts[DPAD_DOWN] = map[int]soundType{
+		RED:       SNARE,
+		BLUE:      TOM,
+		GREEN:     FLOOR_TOM,
+		YELLOW:    CRASH_CYMBAL,
+		ORANGE:    RIDE_CYMBAL,
+		KICKPEDAL: BASS_PEDAL,
+	}
+
 }
 
 func closeSounds() {
@@ -254,30 +289,43 @@ func main() {
 						if jevent.State == sdl.PRESSED {
 							switch jevent.Button {
 							case RED:
-								soundChan <- SNARE
+								fallthrough
 							case BLUE:
-								soundChan <- TOM
+								fallthrough
 							case GREEN:
-								soundChan <- FLOOR_TOM
+								fallthrough
 							case YELLOW:
-								soundChan <- HIGH_HAT_CLOSED_HIT
+								fallthrough
 							case ORANGE:
-								soundChan <- CRASH_CYMBAL //RIDE_CYMBAL
+								fallthrough
 							case KICKPEDAL:
-								soundChan <- BASS_PEDAL
+								soundChan <- layouts[currentLayout][int(jevent.Button)]
 							}
 						} else {
-							if jevent.Button == BUTTON_PS {
+							switch jevent.Button {
+							case BUTTON_PS:
 								quitChan <- true
 								done = true
+							}
+						}
+					case *sdl.JoyHatEvent:
+						jevent := event.(*sdl.JoyHatEvent)
+						fmt.Printf("Hat %d, value %d\n", jevent.Hat, jevent.Value)
+						switch jevent.Value {
+						case DPAD_UP:
+							fallthrough
+						case DPAD_RIGHT:
+							fallthrough
+						case DPAD_DOWN:
+							fallthrough
+						case DPAD_LEFT:
+							if _, found := layouts[jevent.Value][RED]; found {
+								currentLayout = int(jevent.Value)
 							}
 						}
 					case *sdl.JoyAxisEvent:
 						jevent := event.(*sdl.JoyAxisEvent)
 						fmt.Printf("Axis %d, value %d\n", jevent.Axis, jevent.Value)
-					case *sdl.JoyHatEvent:
-						jevent := event.(*sdl.JoyHatEvent)
-						fmt.Printf("Hat %d, value %d\n", jevent.Hat, jevent.Value)
 					}
 				}
 			}
