@@ -5,12 +5,12 @@ package main
 import "C"
 import (
 	"fmt"
+	"log"
 	"os"
-	"reflect"
 	"strconv"
 	"sync"
-	"unsafe"
 
+	term "github.com/nsf/termbox-go"
 	"github.com/veandco/go-sdl2/sdl"
 )
 
@@ -47,12 +47,6 @@ const (
 	RIDE_CYMBAL
 )
 
-type soundPlayerInfo struct {
-	data    []byte            // the bytes to output to the player
-	index   uint              // the current position in the data
-	audioID sdl.AudioDeviceID // the SDL audio device id to play this sound
-}
-
 var (
 	soundPlayer     map[soundType]soundPlayerInfo
 	soundPlayerLock sync.RWMutex
@@ -60,49 +54,6 @@ var (
 	layouts       []map[int]soundType // an array of layouts that map pad/pedal hits to sounds
 	currentLayout = DPAD_UP
 )
-
-//export SoundCallback
-func SoundCallback(userdata unsafe.Pointer, stream *C.Uint8, length C.int) {
-	n := int(length)
-	hdr := reflect.SliceHeader{Data: uintptr(unsafe.Pointer(stream)), Len: n, Cap: n}
-	buf := *(*[]C.Uint8)(unsafe.Pointer(&hdr))
-
-	sound := soundType(uintptr(userdata))
-	soundPlayerLock.RLock()
-	info, found := soundPlayer[sound]
-	soundPlayerLock.RUnlock()
-	for i := 0; i < n; i += 2 {
-		if !found || info.index+1 > uint(len(info.data)) {
-			buf[i] = 0
-			buf[i+1] = 0
-		} else {
-			buf[i] = C.Uint8(info.data[info.index])
-			buf[i+1] = C.Uint8(info.data[info.index+1])
-		}
-		info.index += 2
-		soundPlayerLock.Lock()
-		soundPlayer[sound] = info
-		soundPlayerLock.Unlock()
-	}
-}
-
-func loadSoundDevice(filename string, sound soundType) (*soundPlayerInfo, error) {
-
-	buffer, audioSpec := sdl.LoadWAV(filename)
-	fmt.Printf("%d bytes loaded from %s\n", len(buffer), filename)
-	audioSpec.UserData = unsafe.Pointer(uintptr(sound))
-	audioSpec.Callback = sdl.AudioCallback(C.SoundCallback)
-	deviceID, err := sdl.OpenAudioDevice("", false, audioSpec, nil, 0)
-	if err != nil {
-		return nil, err
-	}
-	fmt.Printf("DeviceID=%d\n", deviceID)
-	return &soundPlayerInfo{
-		data:    buffer,
-		index:   0,
-		audioID: deviceID,
-	}, nil
-}
 
 func initSounds() {
 	var (
@@ -129,7 +80,7 @@ func initSounds() {
 	defer soundPlayerLock.Unlock()
 
 	for _, entry := range list {
-		if info, err = loadSoundDevice(entry.filename, entry.sound); err != nil {
+		if info, err = loadSound(entry.filename, entry.sound); err != nil {
 			fmt.Println(err)
 		} else {
 			soundPlayer[entry.sound] = *info
@@ -168,13 +119,6 @@ func initSounds() {
 
 }
 
-func closeSounds() {
-	for _, info := range soundPlayer {
-		sdl.CloseAudioDevice(info.audioID)
-		sdl.FreeWAV(info.data)
-	}
-}
-
 func playSound(what chan soundType, quit chan bool) {
 	nameMap := map[soundType]string{
 		BASS_PEDAL:          "bass pedal",
@@ -191,17 +135,7 @@ func playSound(what chan soundType, quit chan bool) {
 		select {
 		case sound := <-what:
 			fmt.Println(nameMap[sound])
-			soundPlayerLock.RLock()
-			s, found := soundPlayer[sound]
-			soundPlayerLock.RUnlock()
-			if found {
-				sdl.PauseAudioDevice(s.audioID, true)
-				s.index = 0
-				soundPlayerLock.Lock()
-				soundPlayer[sound] = s
-				soundPlayerLock.Unlock()
-				sdl.PauseAudioDevice(s.audioID, false)
-			}
+			immediatePlaySound(sound)
 		case bye := <-quit:
 			if bye {
 				return
@@ -213,7 +147,10 @@ func playSound(what chan soundType, quit chan bool) {
 func main() {
 	var sdlVer sdl.Version
 
-	sdl.InitSubSystem(sdl.INIT_GAMECONTROLLER | sdl.INIT_JOYSTICK | sdl.INIT_AUDIO)
+	err := sdl.InitSubSystem(sdl.INIT_GAMECONTROLLER | sdl.INIT_JOYSTICK | sdl.INIT_AUDIO)
+	if err != nil {
+		log.Fatal(err)
+	}
 	sdl.VERSION(&sdlVer)
 	fmt.Printf("Using SDL %d.%d.%d\n", sdlVer.Major, sdlVer.Minor, sdlVer.Patch)
 	audioDeviceCount := sdl.GetNumAudioDevices(false)
@@ -247,94 +184,134 @@ func main() {
 	num := int(tmp)
 
 	// Open
-	if sdl.IsGameController(num) {
-		gp := sdl.GameControllerOpen(num)
-		if gp != nil {
-			fmt.Printf("Opened Gamepad %d\n", num)
-			fmt.Printf("Name: %s\n", gp.Name())
-			fmt.Printf("Gamepad mapping: %s\n", gp.Mapping())
 
-			// Close if opened
-			gp.Close()
-		} else {
-			fmt.Printf("Couldn't open Gamepad %d\n", num)
-		}
-	} else {
+	quitChan := make(chan bool)
+	soundChan := make(chan soundType)
 
-		quitChan := make(chan bool)
-		soundChan := make(chan soundType)
+	err = term.Init()
+	if err == nil {
+		defer term.Close()
+		fmt.Println("Key input mode")
+		fmt.Println("[1]     [3]")
+		fmt.Println("[q] [w] [e]")
+		fmt.Println("[  space  ]")
+	}
 
-		sdl.JoystickEventState(sdl.ENABLE)
-		j := sdl.JoystickOpen(num)
-		if j != nil {
-			fmt.Printf("Opened Joystick %d\n", num)
-			fmt.Printf("Name: %s\n", j.Name())
-			fmt.Printf("Number of Axes: %d\n", j.NumAxes())
-			fmt.Printf("Number of Buttons: %d\n", j.NumButtons())
-			fmt.Printf("Number of Balls: %d\n", j.NumBalls())
-			fmt.Printf("Number of Hats: %d\n", j.NumHats())
-
-			done := false
-
-			initSounds()
-			defer closeSounds()
-
-			go playSound(soundChan, quitChan)
-
-			for !done {
-				for event := sdl.PollEvent(); event != nil; event = sdl.PollEvent() {
-					switch event.(type) {
-					case *sdl.JoyButtonEvent:
-						jevent := event.(*sdl.JoyButtonEvent)
-						if jevent.State == sdl.PRESSED {
-							switch jevent.Button {
-							case RED:
-								fallthrough
-							case BLUE:
-								fallthrough
-							case GREEN:
-								fallthrough
-							case YELLOW:
-								fallthrough
-							case ORANGE:
-								fallthrough
-							case KICKPEDAL:
-								soundChan <- layouts[currentLayout][int(jevent.Button)]
-							}
-						} else {
-							switch jevent.Button {
-							case BUTTON_PS:
-								quitChan <- true
-								done = true
-							}
-						}
-					case *sdl.JoyHatEvent:
-						jevent := event.(*sdl.JoyHatEvent)
-						fmt.Printf("Hat %d, value %d\n", jevent.Hat, jevent.Value)
-						switch jevent.Value {
-						case DPAD_UP:
-							fallthrough
-						case DPAD_RIGHT:
-							fallthrough
-						case DPAD_DOWN:
-							fallthrough
-						case DPAD_LEFT:
-							if _, found := layouts[jevent.Value][RED]; found {
-								currentLayout = int(jevent.Value)
-							}
-						}
-					case *sdl.JoyAxisEvent:
-						jevent := event.(*sdl.JoyAxisEvent)
-						fmt.Printf("Axis %d, value %d\n", jevent.Axis, jevent.Value)
-					}
-				}
-			}
-
-			fmt.Println("Done.")
-			// Close if opened
-			j.Close()
-		} else {
+	sdl.JoystickEventState(sdl.ENABLE)
+	var j *sdl.Joystick
+	if num >= 0 {
+		j = sdl.JoystickOpen(num)
+		if j == nil {
 			fmt.Printf("Couldn't open Joystick %d\n", num)
 		}
 	}
+	if j != nil {
+		fmt.Printf("Opened Joystick %d\n", num)
+		fmt.Printf("Name: %s\n", j.Name())
+		fmt.Printf("Number of Axes: %d\n", j.NumAxes())
+		fmt.Printf("Number of Buttons: %d\n", j.NumButtons())
+		fmt.Printf("Number of Balls: %d\n", j.NumBalls())
+		fmt.Printf("Number of Hats: %d\n", j.NumHats())
+		defer j.Close()
+	}
+
+	done := false
+
+	initSounds()
+	defer closeSounds()
+
+	go playSound(soundChan, quitChan)
+
+	fmt.Println(j)
+	for !done {
+		if j != nil {
+			for event := sdl.PollEvent(); event != nil; event = sdl.PollEvent() {
+				switch event.(type) {
+				case *sdl.JoyButtonEvent:
+					jevent := event.(*sdl.JoyButtonEvent)
+					if jevent.State == sdl.PRESSED {
+						switch jevent.Button {
+						case RED:
+							fallthrough
+						case BLUE:
+							fallthrough
+						case GREEN:
+							fallthrough
+						case YELLOW:
+							fallthrough
+						case ORANGE:
+							fallthrough
+						case KICKPEDAL:
+							soundChan <- layouts[currentLayout][int(jevent.Button)]
+						}
+					} else {
+						switch jevent.Button {
+						case BUTTON_PS:
+							quitChan <- true
+							done = true
+						}
+					}
+				case *sdl.JoyHatEvent:
+					jevent := event.(*sdl.JoyHatEvent)
+					fmt.Printf("Hat %d, value %d\n", jevent.Hat, jevent.Value)
+					switch jevent.Value {
+					case DPAD_UP:
+						fallthrough
+					case DPAD_RIGHT:
+						fallthrough
+					case DPAD_DOWN:
+						fallthrough
+					case DPAD_LEFT:
+						if _, found := layouts[jevent.Value][RED]; found {
+							currentLayout = int(jevent.Value)
+						}
+					}
+				case *sdl.JoyAxisEvent:
+					jevent := event.(*sdl.JoyAxisEvent)
+					fmt.Printf("Axis %d, value %d\n", jevent.Axis, jevent.Value)
+				}
+			}
+		} else {
+			switch ev := term.PollEvent(); ev.Type {
+			case term.EventKey:
+				switch ev.Key {
+				case term.KeyEsc:
+					quitChan <- true
+					done = true
+				case term.KeyArrowUp:
+					if _, found := layouts[DPAD_UP][RED]; found {
+						currentLayout = int(DPAD_UP)
+					}
+				case term.KeyArrowRight:
+					if _, found := layouts[DPAD_RIGHT][RED]; found {
+						currentLayout = int(DPAD_RIGHT)
+					}
+				case term.KeyArrowDown:
+					if _, found := layouts[DPAD_DOWN][RED]; found {
+						currentLayout = int(DPAD_DOWN)
+					}
+				case term.KeyArrowLeft:
+					if _, found := layouts[DPAD_LEFT][RED]; found {
+						currentLayout = int(DPAD_LEFT)
+					}
+				case term.KeySpace:
+					soundChan <- layouts[currentLayout][KICKPEDAL]
+				default:
+					switch ev.Ch {
+					case 'q':
+						soundChan <- layouts[currentLayout][RED]
+					case 'w':
+						soundChan <- layouts[currentLayout][BLUE]
+					case 'e':
+						soundChan <- layouts[currentLayout][GREEN]
+					case '1':
+						soundChan <- layouts[currentLayout][YELLOW]
+					case '3':
+						soundChan <- layouts[currentLayout][ORANGE]
+					}
+				}
+			}
+		}
+	}
+	fmt.Println("Done.")
 }
